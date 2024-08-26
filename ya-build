@@ -1,0 +1,397 @@
+#!/bin/env ruby
+
+# frozen_string_literal: true
+
+#
+# This file is part of the git-third-party distribution (https://github.com/kp2pml30/ya-build).
+# Copyright (c) 2024 Kira Prokopenko kp2pml30@gmail.com
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, version 3.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+require 'optparse'
+require 'ostruct'
+require 'fileutils'
+require 'pathname'
+require 'logger'
+require 'json'
+require 'shellwords'
+
+SELF_COMMAND = [RbConfig.ruby, __FILE__] + ARGV.dup
+
+def to_ostruct(object)
+	case object
+	when Hash
+		OpenStruct.new(Hash[object.map { |k, v| [k, to_ostruct(v)] }])
+	when Array
+		object.map { |x| to_ostruct(x) }
+	else
+		object
+	end
+end
+
+def escape_args_to(buf, args)
+	args.each { |a|
+		buf << ' '
+		buf << Shellwords.escape(a).gsub(/\\=/, '=')
+	}
+end
+
+class Target
+	attr_reader :trg_name, :output_file
+	def initialize(trg_name, dependencies)
+		if dependencies.nil?
+			raise "dependecies can't be nil"
+		end
+		@trg_name = trg_name
+		if @trg_name.kind_of?(Pathname)
+			@trg_name = @trg_name.to_s
+		end
+		raise "target name is not a string #{@trg_name}" if not @trg_name.kind_of?(String)
+		@dependencies = dependencies
+	end
+
+	def inspect
+		"<#{self.class.name}:#{@trg_name}>"
+	end
+
+	def dump_rules(buf)
+		buf << "build #{trg_name}: #{mode}"
+		@dependencies.each { |d|
+			buf << ' '
+			if d.kind_of?(Target)
+				buf << d.trg_name
+			elsif d.kind_of?(Pathname)
+				buf << d.to_s
+			elsif d.kind_of?(String)
+				buf << d
+			else
+				raise "Invalid dependency #{d} : #{d.class}"
+			end
+		}
+		buf << "\n"
+		dump_rules_impl(buf)
+		buf << "\n\n"
+	end
+
+	def mode
+		raise "abstract"
+	end
+
+	protected def dump_rules_impl(buf)
+		raise "abstract"
+	end
+end
+
+class CommandTarget < Target
+	attr_reader :output_file
+	def initialize(output_file, dependencies, cwd, commands)
+		super(output_file, dependencies)
+		@output_file = output_file
+		@cwd = cwd
+		@commands = commands
+	end
+
+	protected def dump_rules_impl(buf)
+		if not @cwd.nil?
+			buf << "  WD = #{Shellwords.escape @cwd}\n"
+		end
+		buf << "  COMMAND ="
+		@commands.each_with_index { |c, i|
+			if i != 0
+				buf << " &&"
+			end
+			escape_args_to(buf, c)
+		}
+		buf << "\n"
+	end
+
+	def mode
+		"CUSTOM_COMMAND"
+	end
+end
+
+class CTarget < Target
+	def initialize(output_file, mode, dependencies, flags, cc)
+		super(output_file, dependencies)
+		@mode = mode
+		@output_file = output_file
+		@flags = flags
+		@cc = cc
+	end
+
+	protected def dump_rules_impl(buf)
+		if not @cc.nil?
+			buf << "  CC = #{@cc}\n"
+		end
+		if not @flags.nil? and not @flags.empty?
+			buf << "  cflags ="
+			escape_args_to(buf, @flags)
+			buf << "\n"
+		end
+	end
+
+	def mode()
+		case @mode
+		when "compile"
+			"COMPILE_C"
+		when "link"
+			"LINK_C"
+		else
+			raise "unknown mode #{@mode}"
+		end
+	end
+end
+
+class AliasTarget < Target
+	def initialize(name, dependencies)
+		super(name, dependencies)
+	end
+
+	protected def dump_rules_impl(buf)
+	end
+
+	def mode()
+		"phony"
+	end
+end
+
+class Configurator
+	attr_reader :root_src, :root_build, :config
+
+	def initialize(src, build, config)
+		@root_src = Pathname.new(src).realpath
+		@root_build = Pathname.new(build)
+		@root_build.mkpath()
+		@root_build = @root_build.realpath
+		@config = config.dup
+		@ya_files = []
+
+		@targets = []
+
+		@stack = []
+
+		@logger = Logger.new(STDOUT, level: Logger::INFO)
+		@logger.formatter = proc do |severity, datetime, progname, msg|
+			#date_format = datetime.strftime("%H:%M:%S")
+			"#{severity.ljust(5)} #{msg}\n"
+		end
+	end
+
+	def to_s
+		"<Configurator>"
+	end
+
+	def inspect
+		"<Configurator>"
+	end
+
+	def include_dir(path)
+		new_stack = @stack[-1].clone
+		new_stack.path = new_stack.path.join(path)
+		root_build.join(new_stack.path).mkpath
+		@stack.push(new_stack)
+		begin
+			run_last_stack()
+		ensure
+			@stack.pop
+		end
+	end
+
+	private def run_last_stack()
+		path = @stack[-1].path
+		@logger.info("configuring #{path}")
+		script_path = root_src.join(path, 'yabuild.rb')
+		@ya_files.push(script_path)
+		contents = script_path.read
+		self.instance_eval(contents, script_path.to_s)
+	end
+
+	private def rules_str()
+		<<-EOF
+# ya-build generated, do not edit
+
+CC = clang
+
+rule RERUN_YA_BUILD
+  command = cd #{Shellwords.escape Dir.getwd} && #{SELF_COMMAND.map { |x| Shellwords.escape x }.join(' ')}
+  description = rerunning ya-build
+
+rule CLEAN
+  command = /usr/bin/ninja $FILE_ARG -t clean $TARGETS
+  description = Cleaning all built files...
+
+rule HELP
+  command = /usr/bin/ninja -t targets
+  description = All primary targets available:
+
+rule CUSTOM_COMMAND
+  command = cd $WD && $COMMAND
+  description = $DESC
+
+rule COMPILE_C
+  depfile = $out.d
+  command = $CC -MD -MF $out.d $cflags -o $out -c $in
+
+rule LINK_C
+  command = $CC $cflags -o $out $in
+
+EOF
+	end
+
+	def run()
+		@stack = [
+			OpenStruct.new(
+				:path => Pathname.new("."),
+				:project => "",
+			),
+		]
+		run_last_stack()
+
+		File.write(root_build.join('rules.ninja'), rules_str)
+
+		build_str = String.new()
+		build_str << <<-EOF
+# ya-build generated, do not edit
+# src: #{root_src}
+ninja_required_version = 1.5
+ya_ninja_workdir = #{root_build}
+include rules.ninja
+
+build clean: CLEAN
+
+build help: HELP
+
+build build.ninja: RERUN_YA_BUILD | #{@ya_files.join(' ')}
+  pool = console
+
+EOF
+		@targets.each { |t|
+			t.dump_rules(build_str)
+		}
+		File.write(root_build.join('build.ninja'), build_str)
+	end
+
+	def project(name)
+		new_stack = @stack[-1].clone
+		if new_stack.project == ""
+			new_stack.project += "#{name}"
+		else
+			new_stack.project += "/#{name}"
+		end
+		@stack.push(new_stack)
+		begin
+			yield
+		ensure
+			@stack.pop
+		end
+	end
+
+	def cur_build()
+		root_build.join('generated', @stack[-1].path)
+	end
+
+	def cur_src()
+		root_src.join(@stack[-1].path)
+	end
+
+	def target_command(
+		output_file: nil,
+		dependencies: nil,
+		cwd: nil,
+		command: nil,
+		commands: nil
+	)
+		if commands.nil? == command.nil?
+			raise "exectly one of command or commands must be specified"
+		end
+		if commands.nil?
+			commands = [command]
+		end
+
+		if cwd.nil?
+			cwd = cur_src
+		end
+
+		trg = CommandTarget.new(output_file, dependencies, cwd, commands)
+		@targets.push(trg)
+		trg
+	end
+
+	def target_c(output_file: nil, mode: nil, file: nil, objs: nil, flags: nil, cc: nil)
+		if output_file.nil? or mode.nil?
+			raise "all of output_file and mode must be provided"
+		end
+		if (mode == "compile") == file.nil?
+			raise "file must be provided only for compile"
+		end
+		if (mode == "link") == objs.nil?
+			raise "objs must be provided only for link"
+		end
+		deps = if objs.nil? then [file] else objs end
+		trg = CTarget.new(output_file, mode, deps, flags, cc)
+		@targets.push(trg)
+		trg
+	end
+
+	def target_alias(name: nil, dependencies: nil)
+		if name.nil? or dependencies.nil?
+			raise "all of name and dependencies must be provided"
+		end
+		name_full = @stack[-1].project
+		if name_full != ""
+			name_full += "/"
+		end
+		name_full += name
+		trg = AliasTarget.new(name_full, dependencies)
+		@targets.push(trg)
+		trg
+	end
+end
+
+def config()
+	options = {
+		:src => '.',
+		:build => 'build',
+		:config => nil,
+	}
+	OptionParser.new do |opts|
+		opts.on '-b=DIR', '--build=DIR', 'Output directory'
+		opts.on '-s=DIR', '--src=DIR', 'Project root directory'
+		opts.on '--config=FILE', 'Toolchain file'
+		opts.on '--help' do
+			puts opts
+			exit false
+		end
+	end.parse!(into: options)
+
+	conf = OpenStruct.new
+	if not options[:config].nil?
+		conf = to_ostruct(JSON.load_file(options[:config], {:allow_nan => true, :max_nesting => false}))
+	end
+	configurator = Configurator.new(options[:src], options[:build], conf)
+	configurator.run
+end
+
+modes = {
+	'config' => method(:config)
+}
+
+toExec = modes[ARGV[0]]
+if toExec == nil
+	puts "unknown mode #{ARGV[0]}"
+	puts "expected: #{modes.keys.join('|')}"
+	exit false
+end
+
+toExec.call()
