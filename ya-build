@@ -29,14 +29,32 @@ require 'shellwords'
 
 SELF_COMMAND = [RbConfig.ruby, __FILE__] + ARGV.dup
 
-def to_ostruct(object)
-	case object
-	when Hash
-		OpenStruct.new(Hash[object.map { |k, v| [k, to_ostruct(v)] }])
-	when Array
-		object.map { |x| to_ostruct(x) }
-	else
-		object
+NATIVE_LIB_EXT = (Proc.new {
+	re = [
+		[/linux/i, '.so'],
+		[/windows/i, '.dll'],
+		[/darwin/i, '.dylib'],
+	]
+	re.each { |r|
+		if r[0] =~ RUBY_PLATFORM
+			break r[1]
+		end
+	}
+}).call()
+
+class Hash
+	def to_ostruct
+		prc = Proc.new { |rec, object|
+			case object
+			when Hash
+				OpenStruct.new(Hash[object.map { |k, v| [k, rec.call(rec, v)] }])
+			when Array
+				object.map { |x| rec(x) }
+			else
+				object
+			end
+		}
+		prc.call(prc, self)
 	end
 end
 
@@ -49,9 +67,10 @@ end
 
 class Target
 	attr_reader :trg_name, :output_file
+
 	def initialize(trg_name, dependencies)
 		if dependencies.nil?
-			raise "dependecies can't be nil"
+			raise "dependencies can't be nil"
 		end
 		@trg_name = trg_name
 		if @trg_name.kind_of?(Pathname)
@@ -59,6 +78,10 @@ class Target
 		end
 		raise "target name is not a string #{@trg_name}" if not @trg_name.kind_of?(String)
 		@dependencies = dependencies
+	end
+
+	def add_deps(*deps)
+		@dependencies.concat(deps)
 	end
 
 	def inspect
@@ -167,17 +190,19 @@ class AliasTarget < Target
 end
 
 class Configurator
-	attr_reader :root_src, :root_build, :config
+	attr_reader :root_src, :root_build, :config, :all
 
-	def initialize(src, build, config)
+	def initialize(src, build, extra_conf)
+		@rules = []
 		@root_src = Pathname.new(src).realpath
 		@root_build = Pathname.new(build)
 		@root_build.mkpath()
 		@root_build = @root_build.realpath
-		@config = config.dup
 		@ya_files = []
 
-		@targets = []
+		@all = AliasTarget.new('all', [])
+
+		@targets = [@all]
 
 		@stack = []
 
@@ -185,6 +210,21 @@ class Configurator
 		@logger.formatter = proc do |severity, datetime, progname, msg|
 			#date_format = datetime.strftime("%H:%M:%S")
 			"#{severity.ljust(5)} #{msg}\n"
+		end
+
+		@config = OpenStruct.new
+		cnf = root_src.join('yabuild-default-conf.rb')
+		if cnf.exist?
+			@ya_files.push(cnf)
+			@config = self.instance_eval(cnf.read, cnf.to_s)
+		end
+
+		if not extra_conf.nil?
+			cnf = Pathname.new(extra_conf)
+			if cnf.exist?
+				@ya_files.push(cnf)
+				self.instance_eval(cnf.read, cnf.to_s)
+			end
 		end
 	end
 
@@ -208,6 +248,13 @@ class Configurator
 		end
 	end
 
+	def eval_script(path)
+		script_path = cur_src.join(@stack[-1].path.join(path))
+		@ya_files.push(script_path)
+		contents = script_path.read
+		self.instance_eval(contents, script_path.to_s)
+	end
+
 	private def run_last_stack()
 		path = @stack[-1].path
 		@logger.info("configuring #{path}")
@@ -217,8 +264,12 @@ class Configurator
 		self.instance_eval(contents, script_path.to_s)
 	end
 
+	def add_rule(rule)
+		@rules.push(rule)
+	end
+
 	private def rules_str()
-		<<-EOF
+		beg = [<<-EOF
 # ya-build generated, do not edit
 
 CC = clang
@@ -233,7 +284,7 @@ rule CLEAN
 
 rule HELP
   command = /usr/bin/ninja -t targets
-  description = All primary targets available:
+  description = All primary targets available
 
 rule CUSTOM_COMMAND
   command = cd $WD && $COMMAND
@@ -246,7 +297,13 @@ rule COMPILE_C
 rule LINK_C
   command = $CC $cflags -o $out $in
 
+rule COPY
+  command = cp $in $out
+
 EOF
+		]
+		beg += @rules
+		beg.join("\n\n")
 	end
 
 	def run()
@@ -256,6 +313,7 @@ EOF
 				:project => "",
 			),
 		]
+
 		run_last_stack()
 
 		File.write(root_build.join('rules.ninja'), rules_str)
@@ -279,7 +337,15 @@ EOF
 		@targets.each { |t|
 			t.dump_rules(build_str)
 		}
+		build_str << "default all\n"
 		File.write(root_build.join('build.ninja'), build_str)
+	end
+
+	private def return_target(trg, &block)
+		if not block.nil?
+			trg.instance_eval(&block)
+		end
+		trg
 	end
 
 	def project(name)
@@ -344,10 +410,7 @@ EOF
 		trg
 	end
 
-	def target_alias(name: nil, dependencies: nil)
-		if name.nil? or dependencies.nil?
-			raise "all of name and dependencies must be provided"
-		end
+	def target_alias(name, *dependencies)
 		name_full = @stack[-1].project
 		if name_full != ""
 			name_full += "/"
@@ -375,11 +438,7 @@ def config()
 		end
 	end.parse!(into: options)
 
-	conf = OpenStruct.new
-	if not options[:config].nil?
-		conf = to_ostruct(JSON.load_file(options[:config], {:allow_nan => true, :max_nesting => false}))
-	end
-	configurator = Configurator.new(options[:src], options[:build], conf)
+	configurator = Configurator.new(options[:src], options[:build], options[:config])
 	configurator.run
 end
 
