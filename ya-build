@@ -58,6 +58,12 @@ class Hash
 	end
 end
 
+class OpenStruct
+	def to_json(options=nil)
+		@table.to_json(options)
+	end
+end
+
 def escape_args_to(buf, args)
 	args.each { |a|
 		buf << ' '
@@ -220,7 +226,7 @@ class Configurator
 		end
 
 		if not extra_conf.nil?
-			cnf = Pathname.new(extra_conf)
+			cnf = Pathname.new(extra_conf).realpath
 			if cnf.exist?
 				@ya_files.push(cnf)
 				self.instance_eval(cnf.read, cnf.to_s)
@@ -315,6 +321,8 @@ EOF
 		]
 
 		run_last_stack()
+
+		File.write(root_build.join('config.json'), @config.to_json)
 
 		File.write(root_build.join('rules.ninja'), rules_str)
 
