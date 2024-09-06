@@ -198,7 +198,7 @@ end
 class Configurator
 	attr_reader :root_src, :root_build, :config, :all
 
-	def initialize(src, build, extra_conf)
+	def initialize(src, build, preload)
 		@rules = []
 		@root_src = Pathname.new(src).realpath
 		@root_build = Pathname.new(build)
@@ -225,13 +225,28 @@ class Configurator
 			@config = self.instance_eval(cnf.read, cnf.to_s)
 		end
 
-		if not extra_conf.nil?
-			cnf = Pathname.new(extra_conf).realpath
-			if cnf.exist?
-				@ya_files.push(cnf)
-				self.instance_eval(cnf.read, cnf.to_s)
-			end
+		if not preload.nil?
+			preload = Pathname.new(preload).realpath
+			@ya_files.push(preload)
+			contents = preload.read
+			self.instance_eval(contents, preload.to_s)
 		end
+	end
+
+	private def extend_config_impl(l, r)
+		if l.kind_of? Hash
+			l.merge(r)
+		elsif l.kind_of? OpenStruct
+			OpenStruct.new(l.instance_eval { @table.merge(r) })
+		elsif r.kind_of?(Proc)
+			r.call(l)
+		else
+			r
+		end
+	end
+
+	def extend_config(obj)
+		@config = extend_config_impl(@config, obj)
 	end
 
 	def to_s
@@ -439,14 +454,14 @@ def config()
 	OptionParser.new do |opts|
 		opts.on '-b=DIR', '--build=DIR', 'Output directory'
 		opts.on '-s=DIR', '--src=DIR', 'Project root directory'
-		opts.on '--config=FILE', 'Toolchain file'
+		opts.on '--preload=FILE', 'Toolchain file'
 		opts.on '--help' do
 			puts opts
 			exit false
 		end
 	end.parse!(into: options)
 
-	configurator = Configurator.new(options[:src], options[:build], options[:config])
+	configurator = Configurator.new(options[:src], options[:build], options[:preload])
 	configurator.run
 end
 
