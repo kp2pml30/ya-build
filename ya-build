@@ -72,9 +72,10 @@ def escape_args_to(buf, args)
 end
 
 class Target
-	attr_reader :trg_name, :output_file
+	attr_reader :trg_name, :meta
 
 	def initialize(trg_name, dependencies)
+		@meta = OpenStruct.new
 		if dependencies.nil?
 			raise "dependencies can't be nil"
 		end
@@ -82,7 +83,7 @@ class Target
 		if @trg_name.kind_of?(Pathname)
 			@trg_name = @trg_name.to_s
 		end
-		raise "target name is not a string #{@trg_name}" if not @trg_name.kind_of?(String)
+		raise "target name is not a string (got `#{@trg_name}`)" if not @trg_name.kind_of?(String)
 		@dependencies = dependencies
 	end
 
@@ -124,8 +125,9 @@ end
 
 class CommandTarget < Target
 	attr_reader :output_file
-	def initialize(output_file, dependencies, cwd, commands)
+	def initialize(output_file, dependencies, cwd, commands, depfile)
 		super(output_file, dependencies)
+		@depfile = depfile
 		@output_file = output_file
 		@cwd = cwd
 		@commands = commands
@@ -134,6 +136,9 @@ class CommandTarget < Target
 	protected def dump_rules_impl(buf)
 		if not @cwd.nil?
 			buf << "  WD = #{Shellwords.escape @cwd}\n"
+		end
+		if not @depfile.nil?
+			buf << "  depfile = #{@depfile}\n"
 		end
 		buf << "  COMMAND ="
 		@commands.each_with_index { |c, i|
@@ -151,6 +156,7 @@ class CommandTarget < Target
 end
 
 class CTarget < Target
+	attr_reader :output_file
 	def initialize(output_file, mode, dependencies, flags, cc)
 		super(output_file, dependencies)
 		@mode = mode
@@ -260,9 +266,9 @@ class Configurator
 	def include_dir(path)
 		new_stack = @stack[-1].clone
 		new_stack.path = new_stack.path.join(path)
-		root_build.join(new_stack.path).mkpath
 		@stack.push(new_stack)
 		begin
+			cur_build.mkpath()
 			run_last_stack()
 		ensure
 			@stack.pop
@@ -364,7 +370,20 @@ EOF
 		File.write(root_build.join('build.ninja'), build_str)
 	end
 
+	def find_target(name)
+		suitable = @targets.filter { |trg|
+			trg.trg_name.match?(name)
+		}
+		raise "couldn't find target by name #{name} ; suitable: #{suitable}" if suitable.size() != 1
+		suitable[0]
+	end
+
+	private def register_target(trg)
+		@targets.push(trg)
+	end
+
 	private def return_target(trg, &block)
+		register_target(trg)
 		if not block.nil?
 			trg.instance_eval(&block)
 		end
@@ -395,11 +414,13 @@ EOF
 	end
 
 	def target_command(
-		output_file: nil,
-		dependencies: nil,
+		output_file:,
+		dependencies:,
 		cwd: nil,
 		command: nil,
-		commands: nil
+		commands: nil,
+		depfile: nil,
+		&blk
 	)
 		if commands.nil? == command.nil?
 			raise "exectly one of command or commands must be specified"
@@ -412,15 +433,11 @@ EOF
 			cwd = cur_src
 		end
 
-		trg = CommandTarget.new(output_file, dependencies, cwd, commands)
-		@targets.push(trg)
-		trg
+		trg = CommandTarget.new(output_file, dependencies, cwd, commands, depfile)
+		return_target(trg, &blk)
 	end
 
-	def target_c(output_file: nil, mode: nil, file: nil, objs: nil, flags: nil, cc: nil)
-		if output_file.nil? or mode.nil?
-			raise "all of output_file and mode must be provided"
-		end
+	def target_c(output_file:, mode:, file: nil, objs: nil, flags: nil, cc: nil, &blk)
 		if (mode == "compile") == file.nil?
 			raise "file must be provided only for compile"
 		end
@@ -429,19 +446,17 @@ EOF
 		end
 		deps = if objs.nil? then [file] else objs end
 		trg = CTarget.new(output_file, mode, deps, flags, cc)
-		@targets.push(trg)
-		trg
+		return_target(trg, &blk)
 	end
 
-	def target_alias(name, *dependencies)
+	def target_alias(name, *dependencies, &blk)
 		name_full = @stack[-1].project
 		if name_full != ""
 			name_full += "/"
 		end
 		name_full += name
 		trg = AliasTarget.new(name_full, dependencies)
-		@targets.push(trg)
-		trg
+		return_target(trg, &blk)
 	end
 end
 
