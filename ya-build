@@ -27,7 +27,7 @@ require 'logger'
 require 'json'
 require 'shellwords'
 
-SELF_COMMAND = [RbConfig.ruby, __FILE__] + ARGV.dup
+SELF_COMMAND = [RbConfig.ruby, Pathname.new(__FILE__).realpath] + ARGV.dup
 
 NATIVE_LIB_EXT = (Proc.new {
 	re = [
@@ -106,7 +106,7 @@ class Target
 			elsif d.kind_of?(String)
 				buf << d
 			else
-				raise "Invalid dependency #{d} : #{d.class}"
+				raise "Invalid dependency #{d} : #{d.class} for #{self}"
 			end
 		}
 		buf << "\n"
@@ -155,10 +155,39 @@ class CommandTarget < Target
 	end
 end
 
+class ConfigureGeneratedTarget < Target
+	def initialize(configurator, output_file)
+		@configurator = configurator
+		super(output_file, [])
+	end
+	def dump_rules(buf)
+		buf << "build #{trg_name}: #{mode}"
+		@configurator.instance_eval { @ya_files }.each { |d|
+			buf << ' '
+			if d.kind_of?(Target)
+				buf << d.trg_name
+			elsif d.kind_of?(Pathname)
+				buf << d.to_s
+			elsif d.kind_of?(String)
+				buf << d
+			else
+				raise "Invalid dependency #{d} : #{d.class}"
+			end
+		}
+		buf << "\n"
+		buf << "  pool = console\n"
+		buf << "\n"
+	end
+	def mode
+		"RERUN_YA_BUILD"
+	end
+end
+
 class CTarget < Target
 	attr_reader :output_file
-	def initialize(output_file, mode, dependencies, flags, cc)
+	def initialize(output_file, mode, dependencies, flags, cc, root_dir)
 		super(output_file, dependencies)
+		@root_dir = root_dir
 		@mode = mode
 		@output_file = output_file
 		@flags = flags
@@ -166,6 +195,9 @@ class CTarget < Target
 	end
 
 	protected def dump_rules_impl(buf)
+		if @mode != "link"
+			buf << "  ROOT_DIR = #{Shellwords.escape @root_dir}/\n"
+		end
 		if not @cc.nil?
 			buf << "  CC = #{@cc}\n"
 		end
@@ -212,9 +244,12 @@ class Configurator
 		@root_build = @root_build.realpath
 		@ya_files = []
 
+		@trivial_targets = String.new
+
 		@all = AliasTarget.new('all', [])
 
 		@targets = [@all]
+		mark_as_config_generated('build.ninja')
 
 		@stack = []
 
@@ -319,7 +354,9 @@ rule CUSTOM_COMMAND
 
 rule COMPILE_C
   depfile = $out.d
-  command = $CC -MD -MF $out.d $cflags -o $out -c $in
+  command = cd $ROOT_DIR && \
+    $CC -MD -MF $out.d $cflags -o $out -c "$$(realpath -s "--relative-to=$ROOT_DIR" "$in")" && \
+    #{[RbConfig.ruby, Pathname.new(__FILE__).realpath, '__patch_dep'].map(&Shellwords.method(:escape)).join(' ')} $ROOT_DIR $out.d
 
 rule LINK_C
   command = $CC $cflags -o $out $in
@@ -358,9 +395,6 @@ include rules.ninja
 build clean: CLEAN
 
 build help: HELP
-
-build build.ninja: RERUN_YA_BUILD | #{@ya_files.join(' ')}
-  pool = console
 
 EOF
 		@targets.each { |t|
@@ -437,15 +471,20 @@ EOF
 		return_target(trg, &blk)
 	end
 
-	def target_c(output_file:, mode:, file: nil, objs: nil, flags: nil, cc: nil, &blk)
+	def target_c(output_file:, mode:, root_dir: nil, file: nil, objs: nil, flags: nil, cc: nil, &blk)
 		if (mode == "compile") == file.nil?
 			raise "file must be provided only for compile"
 		end
 		if (mode == "link") == objs.nil?
 			raise "objs must be provided only for link"
 		end
-		deps = if objs.nil? then [file] else objs end
-		trg = CTarget.new(output_file, mode, deps, flags, cc)
+		if root_dir.nil?
+			root_dir = cur_src
+		end
+		deps = if objs.nil? then [
+			root_dir.join(file)
+		] else objs end
+		trg = CTarget.new(output_file, mode, deps, flags, cc, root_dir)
 		return_target(trg, &blk)
 	end
 
@@ -457,6 +496,11 @@ EOF
 		name_full += name
 		trg = AliasTarget.new(name_full, dependencies)
 		return_target(trg, &blk)
+	end
+
+	def mark_as_config_generated(file)
+		register_target(ConfigureGeneratedTarget.new(self, file))
+		return
 	end
 end
 
@@ -480,14 +524,56 @@ def config()
 	configurator.run
 end
 
+def patch_dep()
+	_, root, dep = ARGV
+	root = Pathname.new(root)
+	f = File.read(dep)
+	deps = []
+	last_dep = []
+	f.lines { |l|
+		l = l.strip()
+		splitted = Shellwords.split(l)
+		last_dep.concat(splitted.filter { |x| x != ':' && x != '\\' }. map { |f|
+			if f.end_with?(':')
+				f = f[...-1]
+			end
+			f = Pathname.new(f)
+			if f.absolute?
+				f
+			else
+				root.join(f)
+			end
+		})
+		if splitted.size == 0 || splitted[-1] != '\\'
+			if last_dep.size != 0
+				deps << last_dep
+				last_dep = []
+			end
+		end
+	}
+	if last_dep.size != 0
+		deps << last_dep
+	end
+	res = String.new
+	deps.each { |d|
+		res << d[0].to_s << ":"
+		d[1..].each { |d|
+			res << ' ' << Shellwords.escape(d.to_s)
+		}
+		res << "\n\n"
+	}
+	File.write(dep, res)
+end
+
 modes = {
-	'config' => method(:config)
+	'config' => method(:config),
+	'__patch_dep' => method(:patch_dep)
 }
 
 toExec = modes[ARGV[0]]
 if toExec == nil
 	puts "unknown mode #{ARGV[0]}"
-	puts "expected: #{modes.keys.join('|')}"
+	puts "expected: #{modes.keys.filter{ |x| !x.start_with?('__') }.join('|')}"
 	exit false
 end
 
