@@ -233,6 +233,19 @@ class AliasTarget < Target
 	end
 end
 
+class CopyTarget < Target
+	def initialize(dest, src)
+		super(dest, [src])
+	end
+
+	protected def dump_rules_impl(buf)
+	end
+
+	def mode()
+		"COPY"
+	end
+end
+
 class Configurator
 	attr_reader :root_src, :root_build, :config, :all
 
@@ -468,6 +481,11 @@ EOF
 		end
 
 		trg = CommandTarget.new(output_file, dependencies, cwd, commands, depfile)
+		return_target(trg, &blk)
+	end
+
+	def target_copy(dest:, src:, &blk)
+		trg = CopyTarget.new(dest, src)
 		return_target(trg, &blk)
 	end
 
