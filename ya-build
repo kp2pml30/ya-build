@@ -358,7 +358,7 @@ rule CLEAN
   description = Cleaning all built files...
 
 rule HELP
-  command = /usr/bin/ninja -t targets
+  command = /usr/bin/ninja -t targets rule phony rule CLEAN rule HELP
   description = All primary targets available
 
 rule CUSTOM_COMMAND
