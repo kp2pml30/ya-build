@@ -72,7 +72,7 @@ def escape_args_to(buf, args)
 end
 
 class Target
-	attr_reader :trg_name, :meta
+	attr_reader :trg_name, :meta, :outputs
 
 	def initialize(trg_name, dependencies)
 		@meta = OpenStruct.new
@@ -83,6 +83,7 @@ class Target
 		if @trg_name.kind_of?(Pathname)
 			@trg_name = @trg_name.to_s
 		end
+		@outputs = [trg_name]
 		raise "target name is not a string (got `#{@trg_name}`)" if not @trg_name.kind_of?(String)
 		@dependencies = dependencies
 	end
@@ -96,7 +97,9 @@ class Target
 	end
 
 	def dump_rules(buf)
-		buf << "build #{trg_name}: #{mode}"
+		buf << "build "
+		escape_args_to(buf, outputs)
+		buf << ": #{mode}"
 		@dependencies.each { |d|
 			buf << ' '
 			if d.kind_of?(Target)
@@ -160,23 +163,8 @@ class ConfigureGeneratedTarget < Target
 		@configurator = configurator
 		super(output_file, [])
 	end
-	def dump_rules(buf)
-		buf << "build #{trg_name}: #{mode}"
-		@configurator.instance_eval { @ya_files }.each { |d|
-			buf << ' '
-			if d.kind_of?(Target)
-				buf << d.trg_name
-			elsif d.kind_of?(Pathname)
-				buf << d.to_s
-			elsif d.kind_of?(String)
-				buf << d
-			else
-				raise "Invalid dependency #{d} : #{d.class}"
-			end
-		}
-		buf << "\n"
+	def dump_rules_impl(buf)
 		buf << "  pool = console\n"
-		buf << "\n"
 	end
 	def mode
 		"RERUN_YA_BUILD"
@@ -261,8 +249,8 @@ class Configurator
 
 		@all = AliasTarget.new('all', [])
 
-		@targets = [@all]
-		mark_as_config_generated('build.ninja')
+		@config_target = ConfigureGeneratedTarget.new(self, 'build.ninja')
+		@targets = [@all, @config_target]
 
 		@stack = []
 
@@ -517,8 +505,7 @@ EOF
 	end
 
 	def mark_as_config_generated(file)
-		register_target(ConfigureGeneratedTarget.new(self, file))
-		return
+		@config_target.outputs.push file
 	end
 end
 
