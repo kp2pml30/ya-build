@@ -89,7 +89,7 @@ class Target
 	end
 
 	def add_deps(*deps)
-		@dependencies.concat(deps)
+		@dependencies.concat(deps.flatten)
 	end
 
 	def inspect
@@ -235,7 +235,16 @@ class CopyTarget < Target
 end
 
 class Configurator
-	attr_reader :root_src, :root_build, :config, :all
+	attr_reader :root_src, :root_build, :config
+
+	private def get_tag_target(tag)
+		ret = @tags[tag]
+		return ret if not ret.nil?
+		ret = AliasTarget.new("tags/#{tag}", [])
+		@tags[tag] = ret
+		register_target(ret)
+		ret
+	end
 
 	def initialize(src, build, preload)
 		@rules = []
@@ -247,12 +256,14 @@ class Configurator
 
 		@trivial_targets = String.new
 
-		@all = AliasTarget.new('all', [])
+		@tags = {}
 
 		@config_target = ConfigureGeneratedTarget.new(self, 'build.ninja')
-		@targets = [@all, @config_target]
+		@targets = [@config_target]
 
 		@stack = []
+
+		get_tag_target('all')
 
 		@logger = Logger.new(STDOUT, level: Logger::INFO)
 		@logger.formatter = proc do |severity, datetime, progname, msg|
@@ -401,7 +412,7 @@ EOF
 		@targets.each { |t|
 			t.dump_rules(build_str)
 		}
-		build_str << "default all\n"
+		build_str << "default tags/all\n"
 		File.write(root_build.join('build.ninja'), build_str)
 	end
 
@@ -417,8 +428,11 @@ EOF
 		@targets.push(trg)
 	end
 
-	private def return_target(trg, &block)
+	private def return_target(trg, tags: [], &block)
 		register_target(trg)
+		tags.map { |t| get_tag_target(t) }.each { |t|
+			t.add_deps trg
+		}
 		if not block.nil?
 			trg.instance_eval(&block)
 		end
@@ -455,6 +469,7 @@ EOF
 		command: nil,
 		commands: nil,
 		depfile: nil,
+		**kwargs,
 		&blk
 	)
 		if commands.nil? == command.nil?
@@ -469,15 +484,15 @@ EOF
 		end
 
 		trg = CommandTarget.new(output_file, dependencies, cwd, commands, depfile)
-		return_target(trg, &blk)
+		return_target(trg, **kwargs, &blk)
 	end
 
-	def target_copy(dest:, src:, &blk)
+	def target_copy(dest:, src:, **kwargs, &blk)
 		trg = CopyTarget.new(dest, src)
-		return_target(trg, &blk)
+		return_target(trg, **kwargs, &blk)
 	end
 
-	def target_c(output_file:, mode:, root_dir: nil, file: nil, objs: nil, flags: nil, cc: nil, &blk)
+	def target_c(output_file:, mode:, root_dir: nil, file: nil, objs: nil, flags: nil, cc: nil, **kwargs, &blk)
 		if (mode == "compile") == file.nil?
 			raise "file must be provided only for compile"
 		end
@@ -491,17 +506,17 @@ EOF
 			root_dir.join(file)
 		] else objs end
 		trg = CTarget.new(output_file, mode, deps, flags, cc, root_dir)
-		return_target(trg, &blk)
+		return_target(trg, **kwargs, &blk)
 	end
 
-	def target_alias(name, *dependencies, &blk)
+	def target_alias(name, *dependencies, **kwargs, &blk)
 		name_full = @stack[-1].project
 		if name_full != ""
 			name_full += "/"
 		end
 		name_full += name
 		trg = AliasTarget.new(name_full, dependencies)
-		return_target(trg, &blk)
+		return_target(trg, **kwargs, &blk)
 	end
 
 	def mark_as_config_generated(file)
