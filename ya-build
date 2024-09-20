@@ -367,7 +367,7 @@ rule CUSTOM_COMMAND
 rule COMPILE_C
   depfile = $out.d
   command = cd $ROOT_DIR && \
-    $CC -MD -MF $out.d $cflags -o $out -c "$$(realpath -s "--relative-to=$ROOT_DIR" "$in")" && \
+    $CC -MD -MF $out.d $cflags -o $out "$$(#{[RbConfig.ruby, Pathname.new(__FILE__).realpath, '__realpath_to_from'].map(&Shellwords.method(:escape)).join(' ')} "$in" "$ROOT_DIR")" && \
     #{[RbConfig.ruby, Pathname.new(__FILE__).realpath, '__patch_dep'].map(&Shellwords.method(:escape)).join(' ')} $ROOT_DIR $out.d
 
 rule LINK_C
@@ -585,9 +585,15 @@ def patch_dep()
 	File.write(dep, res)
 end
 
+def realpath_to_from
+	_, to, from = ARGV
+	puts Pathname.new(to).relative_path_from(from)
+end
+
 modes = {
 	'config' => method(:config),
-	'__patch_dep' => method(:patch_dep)
+	'__patch_dep' => method(:patch_dep),
+	'__realpath_to_from' => method(:realpath_to_from)
 }
 
 toExec = modes[ARGV[0]]
