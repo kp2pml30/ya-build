@@ -29,7 +29,7 @@ require 'shellwords'
 
 SELF_COMMAND = [RbConfig.ruby, Pathname.new(__FILE__).realpath] + ARGV.dup
 
-NATIVE_LIB_EXT = (Proc.new {
+NATIVE_SHARED_LIB_EXT = (Proc.new {
 	re = [
 		[/linux/i, '.so'],
 		[/windows/i, '.dll'],
@@ -41,6 +41,8 @@ NATIVE_LIB_EXT = (Proc.new {
 		end
 	}
 }).call()
+
+NATIVE_STATIC_LIB_EXT = '.a'
 
 class Hash
 	def to_ostruct
@@ -128,15 +130,19 @@ end
 
 class CommandTarget < Target
 	attr_reader :output_file
-	def initialize(output_file, dependencies, cwd, commands, depfile)
+	def initialize(output_file, dependencies, cwd, commands, depfile, pool)
 		super(output_file, dependencies)
 		@depfile = depfile
 		@output_file = output_file
 		@cwd = cwd
 		@commands = commands
+		@pool = pool
 	end
 
 	protected def dump_rules_impl(buf)
+		if not @pool.nil?
+			buf << "  pool = #{@pool}\n"
+		end
 		if not @cwd.nil?
 			buf << "  WD = #{Shellwords.escape @cwd}\n"
 		end
@@ -252,7 +258,6 @@ class Configurator
 		@root_build = Pathname.new(build)
 		@root_build.mkpath()
 		@root_build = @root_build.realpath
-		@ya_files = []
 
 		@trivial_targets = String.new
 
@@ -274,13 +279,13 @@ class Configurator
 		@config = OpenStruct.new
 		cnf = root_src.join('yabuild-default-conf.rb')
 		if cnf.exist?
-			@ya_files.push(cnf)
+			@config_target.add_deps(cnf)
 			@config = self.instance_eval(cnf.read, cnf.to_s)
 		end
 
 		if not preload.nil?
 			preload = Pathname.new(preload).realpath
-			@ya_files.push(preload)
+			@config_target.add_deps(preload)
 			contents = preload.read
 			self.instance_eval(contents, preload.to_s)
 		end
@@ -324,7 +329,7 @@ class Configurator
 
 	def eval_script(path)
 		script_path = cur_src.join(@stack[-1].path.join(path))
-		@ya_files.push(script_path)
+		@config_target.add_deps(script_path)
 		contents = script_path.read
 		self.instance_eval(contents, script_path.to_s)
 	end
@@ -333,7 +338,7 @@ class Configurator
 		path = @stack[-1].path
 		@logger.info("configuring #{path}")
 		script_path = root_src.join(path, 'yabuild.rb')
-		@ya_files.push(script_path)
+		@config_target.add_deps(script_path)
 		contents = script_path.read
 		self.instance_eval(contents, script_path.to_s)
 	end
@@ -469,6 +474,7 @@ EOF
 		command: nil,
 		commands: nil,
 		depfile: nil,
+		pool: nil,
 		**kwargs,
 		&blk
 	)
@@ -483,7 +489,7 @@ EOF
 			cwd = cur_src
 		end
 
-		trg = CommandTarget.new(output_file, dependencies, cwd, commands, depfile)
+		trg = CommandTarget.new(output_file, dependencies, cwd, commands, depfile, pool)
 		return_target(trg, **kwargs, &blk)
 	end
 
@@ -509,18 +515,28 @@ EOF
 		return_target(trg, **kwargs, &blk)
 	end
 
-	def target_alias(name, *dependencies, **kwargs, &blk)
+	def target_alias(name, *dependencies, inherit_meta: [], **kwargs, &blk)
 		name_full = @stack[-1].project
 		if name_full != ""
 			name_full += "/"
 		end
 		name_full += name
 		trg = AliasTarget.new(name_full, dependencies)
+		if dependencies.size() != 1 and inherit_meta.size() != 0
+			raise "Can inherit meta only for single dependency alias"
+		end
+		inherit_meta.each { |prop|
+			trg.meta.send("#{prop}=", dependencies[0].meta.send(prop))
+		}
 		return_target(trg, **kwargs, &blk)
 	end
 
 	def mark_as_config_generated(file)
 		@config_target.outputs.push file
+	end
+
+	def reconfigure_on_change(file)
+		@config_target.add_deps file
 	end
 end
 
