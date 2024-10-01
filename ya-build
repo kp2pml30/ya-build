@@ -252,7 +252,7 @@ class Configurator
 		ret
 	end
 
-	def initialize(src, build, preload)
+	def initialize(src, build, preloads)
 		@rules = []
 		@root_src = Pathname.new(src).realpath
 		@root_build = Pathname.new(build)
@@ -283,12 +283,12 @@ class Configurator
 			@config = self.instance_eval(cnf.read, cnf.to_s)
 		end
 
-		if not preload.nil?
+		preloads.each { |preload|
 			preload = Pathname.new(preload).realpath
 			@config_target.add_deps(preload)
 			contents = preload.read
 			self.instance_eval(contents, preload.to_s)
-		end
+		}
 	end
 
 	private def extend_config_impl(l, r)
@@ -545,18 +545,22 @@ def config()
 		:src => '.',
 		:build => 'build',
 		:config => nil,
+		:preloads => [],
 	}
 	OptionParser.new do |opts|
 		opts.on '-b=DIR', '--build=DIR', 'Output directory'
 		opts.on '-s=DIR', '--src=DIR', 'Project root directory'
-		opts.on '--preload=FILE', 'Toolchain file'
+		opts.on '--preload=FILE', 'Toolchain file' do |f|
+			options[:preloads] << f
+			nil
+		end
 		opts.on '--help' do
 			puts opts
 			exit false
 		end
 	end.parse!(into: options)
 
-	configurator = Configurator.new(options[:src], options[:build], options[:preload])
+	configurator = Configurator.new(options[:src], options[:build], options[:preloads])
 	configurator.run
 end
 
