@@ -130,8 +130,9 @@ end
 
 class CommandTarget < Target
 	attr_reader :output_file
-	def initialize(output_file, dependencies, cwd, commands, depfile, pool)
+	def initialize(output_file, dependencies, cwd, commands, depfile, pool, env)
 		super(output_file, dependencies)
+		@env = env
 		@depfile = depfile
 		@output_file = output_file
 		@cwd = cwd
@@ -140,6 +141,13 @@ class CommandTarget < Target
 	end
 
 	protected def dump_rules_impl(buf)
+		if @env.size > 0
+			buf << "  ENV = env"
+			@env.each { |k, v|
+				buf << ' ' << k << '=' << Shellwords.escape(v).gsub(/\\=/, '=')
+			}
+			buf << "\n"
+		end
 		if not @pool.nil?
 			buf << "  pool = #{@pool}\n"
 		end
@@ -241,7 +249,7 @@ class CopyTarget < Target
 end
 
 class Configurator
-	attr_reader :root_src, :root_build, :config
+	attr_reader :root_src, :root_build, :config, :logger
 
 	private def get_tag_target(tag)
 		ret = @tags[tag]
@@ -293,11 +301,21 @@ class Configurator
 
 	private def extend_config_impl(l, r)
 		if l.kind_of? Hash
-			l.merge(r)
+			l.merge(r) { |k, ov, nv|
+				extend_config_impl ov, nv
+			}
 		elsif l.kind_of? OpenStruct
-			OpenStruct.new(l.instance_eval { @table.merge(r) })
+			OpenStruct.new(l.instance_eval {
+				@table.merge(r) { |k, ov, nv|
+					extend_config_impl ov, nv
+				}.transform_values { |v|
+					if v.kind_of? Hash then v.to_ostruct else v end
+				}
+			})
 		elsif r.kind_of?(Proc)
 			r.call(l)
+		elsif r.kind_of?(Hash)
+			r.to_ostruct
 		else
 			r
 		end
@@ -366,7 +384,7 @@ rule HELP
   description = All primary targets available
 
 rule CUSTOM_COMMAND
-  command = cd $WD && $COMMAND
+  command = cd $WD && $ENV $COMMAND
   description = $DESC
 
 rule COMPILE_C
@@ -467,6 +485,30 @@ EOF
 		root_src.join(@stack[-1].path)
 	end
 
+	def find_executable(name, critical: false)
+		paths = ENV['PATH'].split(':')
+		paths << '/usr/bin'
+		paths << '/bin'
+		paths << "#{ENV['HOME']}/.local/bin"
+		paths << "#{ENV['HOME']}/.cargo/bin"
+		paths.each { |p|
+			check = ['', '.elf', '.exe']
+			check.each { |c|
+				cur_p = Pathname.new(p).join("#{name}#{c}")
+				if cur_p.exist?()
+					logger.info("checking for #{name}... located at #{cur_p}")
+					return cur_p
+				end
+			}
+		}
+		if critical
+			logger.error("checking for #{name}... not found")
+			raise "#{name} not found in path"
+		end
+		logger.info("checking for #{name}... not found")
+		return nil
+	end
+
 	def target_command(
 		output_file:,
 		dependencies:,
@@ -475,6 +517,7 @@ EOF
 		commands: nil,
 		depfile: nil,
 		pool: nil,
+		env: {},
 		**kwargs,
 		&blk
 	)
@@ -489,7 +532,7 @@ EOF
 			cwd = cur_src
 		end
 
-		trg = CommandTarget.new(output_file, dependencies, cwd, commands, depfile, pool)
+		trg = CommandTarget.new(output_file, dependencies, cwd, commands, depfile, pool, env)
 		return_target(trg, **kwargs, &blk)
 	end
 
