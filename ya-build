@@ -306,12 +306,13 @@ class Configurator
 			}
 		elsif l.kind_of? OpenStruct
 			OpenStruct.new(l.instance_eval {
-				@table.merge(r) { |k, ov, nv|
+					@table
+				}.merge(r) { |k, ov, nv|
 					extend_config_impl ov, nv
 				}.transform_values { |v|
 					if v.kind_of? Hash then v.to_ostruct else v end
 				}
-			})
+			)
 		elsif r.kind_of?(Proc)
 			r.call(l)
 		elsif r.kind_of?(Hash)
