@@ -66,213 +66,211 @@ class OpenStruct
 	end
 end
 
-def escape_args_to(buf, args)
-	args.each { |a|
-		buf << ' '
-		buf << Shellwords.escape(a).gsub(/\\=/, '=')
-	}
+class NinjaPiece
+	protected def dump_ninja(buf)
+		raise "abstract"
+	end
 end
 
-class Target
-	attr_reader :trg_name, :meta, :outputs
+class NinjaPieceRaw
+	def initialize(data)
+		@data = data
+	end
+	def dump_ninja(buf)
+		buf << @data << "\n\n"
+	end
+end
 
-	def initialize(trg_name, dependencies)
+class Target < NinjaPiece
+	attr_reader :meta, :outputs, :inputs, :implicit_inputs, :implicit_outputs, :rule
+
+	def initialize(outputs:, inputs:, rule:, implicit_inputs: [], implicit_outputs: [])
+		raise "invalid param" if not outputs.kind_of?(Array)
+		raise "invalid param" if not inputs.kind_of?(Array)
+		raise "invalid param" if not implicit_inputs.kind_of?(Array)
+		raise "invalid param" if not implicit_outputs.kind_of?(Array)
+		raise "rule must be a string" if not rule.kind_of?(String)
+
 		@meta = OpenStruct.new
-		if dependencies.nil?
-			raise "dependencies can't be nil"
+		@implicit_inputs = implicit_inputs
+		@implicit_outputs = implicit_outputs
+		@inputs = inputs.clone
+		@outputs = outputs.clone
+		@rule = rule
+	end
+
+	def dump_ninja(buf)
+		raise "no output" if outputs.size == 0
+		buf << "build"
+		DefaultTargets::escape_args_to(buf, outputs)
+		if implicit_outputs.size > 0
+			buf << " |"
+			DefaultTargets::escape_args_to(buf, implicit_outputs)
 		end
-		@trg_name = trg_name
-		if @trg_name.kind_of?(Pathname)
-			@trg_name = @trg_name.to_s
+		buf << " : #{rule}"
+		DefaultTargets::escape_args_to(buf, inputs)
+		if implicit_inputs.size > 0
+			buf << " |"
+			DefaultTargets::escape_args_to(buf, implicit_inputs)
 		end
-		@outputs = [trg_name]
-		raise "target name is not a string (got `#{@trg_name}`)" if not @trg_name.kind_of?(String)
-		@dependencies = dependencies
+		buf << "\n"
+		cb = Proc.new { |k, v|
+			buf << "  " << k << " = " << v << "\n"
+		}
+		dump_vars cb
+		buf << "\n"
 	end
 
-	def add_deps(*deps)
-		@dependencies.concat(deps.flatten)
+	protected def dump_vars(cb)
+		raise "abstract for #{self}"
 	end
+end
 
-	def inspect
-		"<#{self.class.name}:#{@trg_name}>"
-	end
+module DefaultTargets
 
-	def dump_rules(buf)
-		buf << "build "
-		escape_args_to(buf, outputs)
-		buf << ": #{mode}"
-		@dependencies.each { |d|
-			buf << ' '
-			if d.kind_of?(Target)
-				buf << d.trg_name
-			elsif d.kind_of?(Pathname)
-				buf << d.to_s
-			elsif d.kind_of?(String)
-				buf << d
+	def self.escape_args_to(buf, args)
+		raise "buf can't be nil" if buf.nil?
+		dump_args = args.flat_map { |arg|
+			if arg.kind_of?(Target)
+				arg.outputs + arg.implicit_outputs
+			elsif arg.kind_of?(Pathname)
+				[arg.to_s]
+			elsif arg.kind_of?(String)
+				[arg]
 			else
-				raise "Invalid dependency #{d} : #{d.class} for #{self}"
+				raise "unsupported type #{arg.class} of #{arg}"
 			end
 		}
-		buf << "\n"
-		dump_rules_impl(buf)
-		buf << "\n\n"
+
+		dump_args.each { |a|
+			buf << ' '
+			buf << Shellwords.escape(a).gsub(/\\=/, '=')
+		}
 	end
 
-	def mode
-		raise "abstract"
+	class Phony < Target
+		attr_reader :name
+		def initialize(name:, inputs:, implicit_inputs: [])
+			super(outputs: [name].freeze, inputs: inputs, implicit_inputs: implicit_inputs, implicit_outputs: [].freeze, rule: "phony")
+			@name = name
+		end
+
+		protected def dump_vars(cb)
+		end
 	end
 
-	protected def dump_rules_impl(buf)
-		raise "abstract"
-	end
-end
+	class Command < Target
+		attr_reader :output_file
+		def initialize(output_file, dependencies, cwd, commands, depfile, pool, env)
+			super(outputs: [output_file], inputs: dependencies, rule: 'CUSTOM_COMMAND')
+			@env = env
+			@depfile = depfile
+			@output_file = output_file
+			@cwd = cwd
+			@commands = commands
+			@pool = pool
+		end
 
-class CommandTarget < Target
-	attr_reader :output_file
-	def initialize(output_file, dependencies, cwd, commands, depfile, pool, env)
-		super(output_file, dependencies)
-		@env = env
-		@depfile = depfile
-		@output_file = output_file
-		@cwd = cwd
-		@commands = commands
-		@pool = pool
-	end
-
-	protected def dump_rules_impl(buf)
-		if @env.size > 0
-			buf << "  ENV = env"
-			@env.each { |k, v|
-				buf << ' ' << k << '=' << Shellwords.escape(v).gsub(/\\=/, '=')
+		protected def dump_vars(cb)
+			if @env.size > 0
+				buf = String.new
+				buf << "env"
+				@env.each { |k, v|
+					buf << ' ' << k << '=' << Shellwords.escape(v).gsub(/\\=/, '=')
+				}
+				cb.('ENV', buf)
+			end
+			if not @pool.nil?
+				cb.('pool', @pool)
+			end
+			if not @cwd.nil?
+				cb.('CWD', Shellwords.escape(@cwd))
+			end
+			if not @depfile.nil?
+				cb.('depfile', Shellwords.escape(@depfile))
+			end
+			cmd = String.new
+			@commands.each_with_index { |c, i|
+				if i != 0
+					cmd << " &&"
+				end
+				DefaultTargets::escape_args_to(cmd, c)
 			}
-			buf << "\n"
+			cb.('COMMAND', cmd)
 		end
-		if not @pool.nil?
-			buf << "  pool = #{@pool}\n"
+	end
+
+	class ConfigureGenerated < Target
+		def initialize(configurator)
+			@configurator = configurator
+			super(outputs: [], inputs: [], rule: 'RERUN_YA_BUILD')
 		end
-		if not @cwd.nil?
-			buf << "  WD = #{Shellwords.escape @cwd}\n"
+
+		def dump_vars(cb)
+			cb.('pool', 'console')
 		end
-		if not @depfile.nil?
-			buf << "  depfile = #{@depfile}\n"
+	end
+
+	class C < Target
+		attr_reader :output_file
+		def initialize(output:, inputs:, flags:, cc:, rule:, root_dir: nil)
+			super(outputs: [output].freeze, inputs: inputs, rule: rule)
+			@root_dir = root_dir
+			@output_file = output
+			@flags = flags
+			@cc = cc
 		end
-		buf << "  COMMAND ="
-		@commands.each_with_index { |c, i|
-			if i != 0
-				buf << " &&"
+
+		protected def dump_vars(cb)
+			if not @cc.nil?
+				cb.('CC', Shellwords.escape(@cc))
 			end
-			escape_args_to(buf, c)
-		}
-		buf << "\n"
-	end
-
-	def mode
-		"CUSTOM_COMMAND"
-	end
-end
-
-class ConfigureGeneratedTarget < Target
-	def initialize(configurator, output_file)
-		@configurator = configurator
-		super(output_file, [])
-	end
-	def dump_rules_impl(buf)
-		buf << "  pool = console\n"
-	end
-	def mode
-		"RERUN_YA_BUILD"
-	end
-end
-
-class CTarget < Target
-	attr_reader :output_file
-	def initialize(output_file, mode, dependencies, flags, cc, root_dir)
-		super(output_file, dependencies)
-		@root_dir = root_dir
-		@mode = mode
-		@output_file = output_file
-		@flags = flags
-		@cc = cc
-	end
-
-	protected def dump_rules_impl(buf)
-		if @mode != "link"
-			buf << "  ROOT_DIR = #{Shellwords.escape @root_dir}/\n"
-		end
-		if not @cc.nil?
-			buf << "  CC = #{@cc}\n"
-		end
-		if not @flags.nil? and not @flags.empty?
-			buf << "  cflags ="
-			escape_args_to(buf, @flags)
-			buf << "\n"
+			if not @root_dir.nil?
+				cb.('ROOT_DIR', Shellwords.escape(@root_dir))
+			end
+			if not @flags.nil? and not @flags.empty?
+				cflags  = String.new
+				DefaultTargets::escape_args_to(cflags, @flags)
+				cb.('cflags', cflags)
+			end
 		end
 	end
 
-	def mode()
-		case @mode
-		when "compile"
-			"COMPILE_C"
-		when "link"
-			"LINK_C"
-		else
-			raise "unknown mode #{@mode}"
+	class Copy < Target
+		def initialize(dest, src)
+			super(outputs: [dest].freeze, inputs: src, rule: "COPY")
 		end
-	end
-end
 
-class AliasTarget < Target
-	def initialize(name, dependencies)
-		super(name, dependencies)
-	end
-
-	protected def dump_rules_impl(buf)
-	end
-
-	def mode()
-		"phony"
-	end
-end
-
-class CopyTarget < Target
-	def initialize(dest, src)
-		super(dest, [src])
-	end
-
-	protected def dump_rules_impl(buf)
-	end
-
-	def mode()
-		"COPY"
+		protected def dump_vars(buf)
+		end
 	end
 end
 
 class Configurator
-	attr_reader :root_src, :root_build, :config, :logger
+	attr_reader :root_src, :root_build, :config, :logger, :ninja_path, :ninja_files_parts
 
 	private def get_tag_target(tag)
 		ret = @tags[tag]
 		return ret if not ret.nil?
-		ret = AliasTarget.new("tags/#{tag}", [])
+		ret = DefaultTargets::Phony.new(name: "tags/#{tag}", inputs: [])
 		@tags[tag] = ret
 		register_target(ret)
 		ret
 	end
 
 	def initialize(src, build, preloads)
-		@rules = []
 		@root_src = Pathname.new(src).realpath
 		@root_build = Pathname.new(build)
 		@root_build.mkpath()
 		@root_build = @root_build.realpath
 
-		@trivial_targets = String.new
+		@ninja_files_parts = Hash.new
+		@ninja_files_parts[''] = []
 
 		@tags = {}
 
-		@config_target = ConfigureGeneratedTarget.new(self, 'build.ninja')
-		@targets = [@config_target]
+		@config_target = DefaultTargets::ConfigureGenerated.new(self)
+		@named_targets = []
 
 		@stack = []
 
@@ -285,18 +283,80 @@ class Configurator
 		end
 
 		@config = OpenStruct.new
+		@config.tools = OpenStruct.new
 		cnf = root_src.join('yabuild-default-conf.rb')
 		if cnf.exist?
-			@config_target.add_deps(cnf)
-			@config = self.instance_eval(cnf.read, cnf.to_s)
+			@config_target.inputs.push(cnf)
+			self.instance_eval(cnf.read, cnf.to_s)
 		end
 
 		preloads.each { |preload|
 			preload = Pathname.new(preload).realpath
-			@config_target.add_deps(preload)
-			contents = preload.read
-			self.instance_eval(contents, preload.to_s)
+			@config_target.inputs.push(preload)
+			self.instance_eval(preload.read, preload.to_s)
 		}
+
+		@ninja_path = find_executable('ninja', critical: true)
+
+		fill_default_ninja
+		register_target(@config_target)
+	end
+
+	private def fill_default_ninja
+		default_pieces = []
+		@ninja_files_parts['default-rules'] = default_pieces
+
+		@ninja_files_parts[''] << NinjaPieceRaw.new(<<-EOF
+# ya-build generated, do not edit
+# src: #{root_src}
+ninja_required_version = 1.5
+ya_ninja_workdir = #{root_build}
+include default-rules.ninja
+
+build clean: CLEAN
+
+build help: HELP
+
+EOF
+		)
+
+		default_pieces << NinjaPieceRaw.new(<<-EOF
+# ya-build generated, do not edit
+
+CC = clang
+
+rule RERUN_YA_BUILD
+  command = cd #{Shellwords.escape Dir.getwd} && #{SELF_COMMAND.map { |x| Shellwords.escape x }.join(' ')}
+  description = rerunning ya-build
+
+rule CLEAN
+  command = #{Shellwords.escape ninja_path} $FILE_ARG -t clean $TARGETS
+  description = Cleaning all built files...
+
+rule HELP
+  command = #{Shellwords.escape ninja_path} -t targets rule phony rule CLEAN rule HELP
+  description = All primary targets available
+
+rule CUSTOM_COMMAND
+  command = cd $CWD && $ENV $COMMAND
+  description = $DESC
+
+rule C_COMPILE
+  depfile = $out.d
+  command = $CC \
+        -MD -MF $out.d \
+        -c $cflags \
+        -o $out \
+        $in
+
+rule C_LINK
+  command = $CC $cflags -o $out $in
+
+rule COPY
+  command = cp $in $out
+
+EOF
+)
 	end
 
 	private def extend_config_impl(l, r)
@@ -347,63 +407,19 @@ class Configurator
 	end
 
 	def eval_script(path)
-		script_path = cur_src.join(@stack[-1].path.join(path))
-		@config_target.add_deps(script_path)
+		script_path = cur_src.join(path)
 		contents = script_path.read
+		@config_target.inputs.push script_path
 		self.instance_eval(contents, script_path.to_s)
 	end
 
 	private def run_last_stack()
 		path = @stack[-1].path
-		@logger.info("configuring #{path}")
+		@logger.info("entering #{path}")
 		script_path = root_src.join(path, 'yabuild.rb')
-		@config_target.add_deps(script_path)
+		@config_target.inputs.push(script_path)
 		contents = script_path.read
 		self.instance_eval(contents, script_path.to_s)
-	end
-
-	def add_rule(rule)
-		@rules.push(rule)
-	end
-
-	private def rules_str()
-		beg = [<<-EOF
-# ya-build generated, do not edit
-
-CC = clang
-
-rule RERUN_YA_BUILD
-  command = cd #{Shellwords.escape Dir.getwd} && #{SELF_COMMAND.map { |x| Shellwords.escape x }.join(' ')}
-  description = rerunning ya-build
-
-rule CLEAN
-  command = /usr/bin/ninja $FILE_ARG -t clean $TARGETS
-  description = Cleaning all built files...
-
-rule HELP
-  command = /usr/bin/ninja -t targets rule phony rule CLEAN rule HELP
-  description = All primary targets available
-
-rule CUSTOM_COMMAND
-  command = cd $WD && $ENV $COMMAND
-  description = $DESC
-
-rule COMPILE_C
-  depfile = $out.d
-  command = cd $ROOT_DIR && \
-    $CC -MD -MF $out.d $cflags -o $out "$$(#{[RbConfig.ruby, Pathname.new(__FILE__).realpath, '__realpath_to_from'].map(&Shellwords.method(:escape)).join(' ')} "$in" "$ROOT_DIR")" && \
-    #{[RbConfig.ruby, Pathname.new(__FILE__).realpath, '__patch_dep'].map(&Shellwords.method(:escape)).join(' ')} $ROOT_DIR $out.d
-
-rule LINK_C
-  command = $CC $cflags -o $out $in
-
-rule COPY
-  command = cp $in $out
-
-EOF
-		]
-		beg += @rules
-		beg.join("\n\n")
 	end
 
 	def run()
@@ -418,44 +434,49 @@ EOF
 
 		File.write(root_build.join('config.json'), @config.to_json)
 
-		File.write(root_build.join('rules.ninja'), rules_str)
-
-		build_str = String.new()
-		build_str << <<-EOF
-# ya-build generated, do not edit
-# src: #{root_src}
-ninja_required_version = 1.5
-ya_ninja_workdir = #{root_build}
-include rules.ninja
-
-build clean: CLEAN
-
-build help: HELP
-
-EOF
-		@targets.each { |t|
-			t.dump_rules(build_str)
+		ninja_files_parts.each { |k, v|
+			@config_target.outputs << "#{if k == "" then "build" else k end}.ninja"
 		}
-		build_str << "default tags/all\n"
-		File.write(root_build.join('build.ninja'), build_str)
+
+		ninja_files_parts.each { |k, v|
+			if k == ''
+				k = 'build'
+			end
+			fname = root_build.join("#{k}.ninja")
+			buf = String.new
+			buf << "# ya-build generated, do not edit\n"
+			v.each do |v|
+				v.dump_ninja buf
+			rescue => e
+				logger.error("can't dump #{v.inspect}")
+				raise
+			end
+			if k == 'build'
+				buf << "default tags/all\n"
+			end
+			File.write fname, buf
+		}
 	end
 
 	def find_target(name)
-		suitable = @targets.filter { |trg|
-			trg.trg_name.match?(name)
+		suitable = @named_targets.filter { |trg|
+			trg.name.match?(name)
 		}
 		raise "couldn't find target by name #{name} ; suitable: #{suitable}" if suitable.size() != 1
 		suitable[0]
 	end
 
-	private def register_target(trg)
-		@targets.push(trg)
+	private def register_target(trg, to: '')
+		@ninja_files_parts[to] << trg
+		if trg.kind_of?(DefaultTargets::Phony)
+			@named_targets.push(trg)
+		end
 	end
 
 	private def return_target(trg, tags: [], &block)
 		register_target(trg)
 		tags.map { |t| get_tag_target(t) }.each { |t|
-			t.add_deps trg
+			t.inputs.push trg
 		}
 		if not block.nil?
 			trg.instance_eval(&block)
@@ -486,27 +507,68 @@ EOF
 		root_src.join(@stack[-1].path)
 	end
 
-	def find_executable(name, critical: false)
-		paths = ENV['PATH'].split(':')
-		paths << '/usr/bin'
-		paths << '/bin'
-		paths << "#{ENV['HOME']}/.local/bin"
-		paths << "#{ENV['HOME']}/.cargo/bin"
-		paths.each { |p|
-			check = ['', '.elf', '.exe']
-			check.each { |c|
-				cur_p = Pathname.new(p).join("#{name}#{c}")
-				if cur_p.exist?()
-					logger.info("checking for #{name}... located at #{cur_p}")
-					return cur_p
+	def find_executable(name, critical: false, check_first: [], check_path: true, check_last: [], &blk)
+		chck = Proc.new { |path|
+			if path.nil?
+				next false
+			end
+			if not path.exist?
+				next false
+			end
+			logger.debug("executable #{name} found at #{path}")
+			if blk.nil?
+				next true
+			end
+
+			begin
+				res = blk.(path)
+				if not res
+					logger.info("executable #{name} found at #{path} does not work (check failed)")
+				end
+				res
+			rescue => e
+				logger.info("executable #{name} found at #{path} does not work\n#{e}")
+				false
+			end
+		}
+
+		override = config.tools.send(name)
+		if not override.nil?
+			res = chck.(override)
+			if res.nil? and critical
+				logger.error("executable #{name} not found for override #{override}")
+				raise "#{name} not found"
+			end
+			return res
+		end
+
+		check_first.each { |p|
+			path = Pathname.new(p).join(name)
+			if chck.(path)
+				return path
+			end
+		}
+		if check_path
+			paths = ENV['PATH'].split(':')
+			paths.each { |p|
+				path = Pathname.new(p).join(name)
+				if chck.(path)
+					return path
 				end
 			}
-		}
-		if critical
-			logger.error("checking for #{name}... not found")
-			raise "#{name} not found in path"
 		end
-		logger.info("checking for #{name}... not found")
+		check_last.each { |p|
+			path = Pathname.new(p).join(name)
+			if chck.(path)
+				return path
+			end
+		}
+
+		if critical
+			logger.error("executable #{name} not found")
+			raise "#{name} not found"
+		end
+		logger.info("executable #{name} not found")
 		return nil
 	end
 
@@ -523,7 +585,7 @@ EOF
 		&blk
 	)
 		if commands.nil? == command.nil?
-			raise "exectly one of command or commands must be specified"
+			raise "exactly one of command or commands must be specified"
 		end
 		if commands.nil?
 			commands = [command]
@@ -533,29 +595,24 @@ EOF
 			cwd = cur_src
 		end
 
-		trg = CommandTarget.new(output_file, dependencies, cwd, commands, depfile, pool, env)
+		trg = DefaultTargets::Command.new(output_file, dependencies, cwd, commands, depfile, pool, env)
 		return_target(trg, **kwargs, &blk)
 	end
 
 	def target_copy(dest:, src:, **kwargs, &blk)
-		trg = CopyTarget.new(dest, src)
+		trg = DefaultTargets::Copy.new(dest, src)
 		return_target(trg, **kwargs, &blk)
 	end
 
-	def target_c(output_file:, mode:, root_dir: nil, file: nil, objs: nil, flags: nil, cc: nil, **kwargs, &blk)
-		if (mode == "compile") == file.nil?
-			raise "file must be provided only for compile"
-		end
-		if (mode == "link") == objs.nil?
-			raise "objs must be provided only for link"
-		end
-		if root_dir.nil?
-			root_dir = cur_src
-		end
-		deps = if objs.nil? then [
-			root_dir.join(file)
-		] else objs end
-		trg = CTarget.new(output_file, mode, deps, flags, cc, root_dir)
+	def target_c_compile(output_file:, file:, flags: nil, cc: nil, **kwargs, &blk)
+		real_out = output_file.relative_path_from(root_build)
+		real_file = file.relative_path_from(root_build)
+		trg = DefaultTargets::C.new(output: real_out.to_s, inputs: [real_file.to_s], flags: flags, cc: cc, rule: "C_COMPILE")
+		return_target(trg, **kwargs, &blk)
+	end
+
+	def target_c_link(output_file:, objs:, flags: nil, cc: nil, **kwargs, &blk)
+		trg = DefaultTargets::C.new(output: output_file, inputs: objs, flags: flags, cc: cc, rule: "C_LINK")
 		return_target(trg, **kwargs, &blk)
 	end
 
@@ -565,7 +622,7 @@ EOF
 			name_full += "/"
 		end
 		name_full += name
-		trg = AliasTarget.new(name_full, dependencies)
+		trg = DefaultTargets::Phony.new(name: name_full, inputs: dependencies)
 		if dependencies.size() != 1 and inherit_meta.size() != 0
 			raise "Can inherit meta only for single dependency alias"
 		end
@@ -576,11 +633,11 @@ EOF
 	end
 
 	def mark_as_config_generated(file)
-		@config_target.outputs.push file
+		@config_target.implicit_outputs.push file
 	end
 
 	def reconfigure_on_change(file)
-		@config_target.add_deps file
+		@config_target.inputs.push file
 	end
 end
 
