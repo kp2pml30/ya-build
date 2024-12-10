@@ -281,6 +281,7 @@ class Configurator
 			#date_format = datetime.strftime("%H:%M:%S")
 			"#{severity.ljust(5)} #{msg}\n"
 		end
+		@logger.info("RUBY_PLATFORM is #{RUBY_PLATFORM}")
 
 		@config = OpenStruct.new
 		@config.tools = OpenStruct.new
