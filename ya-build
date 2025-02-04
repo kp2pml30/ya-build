@@ -162,7 +162,10 @@ module DefaultTargets
 	class Command < Target
 		attr_reader :output_file
 		def initialize(output_file, dependencies, cwd, commands, depfile, pool, env)
-			super(outputs: [output_file], inputs: dependencies, rule: 'CUSTOM_COMMAND')
+			if not output_file.kind_of? Array
+				output_file = [output_file]
+			end
+			super(outputs: output_file, inputs: dependencies, rule: 'CUSTOM_COMMAND')
 			@env = env
 			@depfile = depfile
 			@output_file = output_file
