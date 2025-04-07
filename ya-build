@@ -82,13 +82,14 @@ class NinjaPieceRaw
 end
 
 class Target < NinjaPiece
-	attr_reader :meta, :outputs, :inputs, :implicit_inputs, :implicit_outputs, :rule
+	attr_reader :meta, :outputs, :inputs, :implicit_inputs, :order_only_inputs, :implicit_outputs, :rule
 
-	def initialize(outputs:, inputs:, rule:, implicit_inputs: [], implicit_outputs: [])
+	def initialize(outputs:, inputs:, rule:, implicit_inputs: [], implicit_outputs: [], order_only_inputs: [])
 		raise "invalid param" if not outputs.kind_of?(Array)
 		raise "invalid param" if not inputs.kind_of?(Array)
 		raise "invalid param" if not implicit_inputs.kind_of?(Array)
 		raise "invalid param" if not implicit_outputs.kind_of?(Array)
+		raise "invalid param" if not order_only_inputs.kind_of?(Array)
 		raise "rule must be a string" if not rule.kind_of?(String)
 
 		@meta = OpenStruct.new
@@ -96,6 +97,7 @@ class Target < NinjaPiece
 		@implicit_outputs = implicit_outputs
 		@inputs = inputs.clone
 		@outputs = outputs.clone
+		@order_only_inputs = order_only_inputs.clone
 		@rule = rule
 	end
 
@@ -112,6 +114,10 @@ class Target < NinjaPiece
 		if implicit_inputs.size > 0
 			buf << " |"
 			DefaultTargets::escape_args_to(buf, implicit_inputs)
+		end
+		if order_only_inputs.size > 0
+			buf << " ||"
+			DefaultTargets::escape_args_to(buf, order_only_inputs)
 		end
 		buf << "\n"
 		cb = Proc.new { |k, v|
