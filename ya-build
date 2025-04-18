@@ -29,20 +29,51 @@ require 'shellwords'
 
 SELF_COMMAND = [RbConfig.ruby, Pathname.new(__FILE__).realpath] + ARGV.dup
 
-NATIVE_SHARED_LIB_EXT = (Proc.new {
-	re = [
-		[/linux/i, '.so'],
-		[/windows/i, '.dll'],
-		[/darwin/i, '.dylib'],
-	]
-	re.each { |r|
-		if r[0] =~ RUBY_PLATFORM
-			break r[1]
-		end
-	}
-}).call()
+SHARED_LIB_EXTS = {
+	linux: '.so',
+	windows: '.dll',
+	darwin: '.dylib'
+}.freeze
 
-NATIVE_STATIC_LIB_EXT = '.a'
+class TargetSystem
+	attr_reader :os, :arch, :shared_lib_ext, :static_lib_ext
+
+	def initialize(os:, arch:)
+		raise "os is nil" if os.nil?
+		raise "arch is nil" if arch.nil?
+
+		@os = os
+		@arch = arch
+		@shared_lib_ext = SHARED_LIB_EXTS[os]
+		@static_lib_ext = '.a'
+	end
+end
+
+HOST = TargetSystem.new(
+	os: (Proc.new {
+		re = [
+			[/linux/i, :linux],
+			[/windows/i, :windows],
+			[/darwin/i, :darwin],
+		]
+		re.each { |r|
+			if r[0] =~ RUBY_PLATFORM
+				break r[1]
+			end
+		}
+	}).call(),
+	arch: (Proc.new {
+		re = [
+			[/arm64/i, :arm64],
+			[/x86_64/i, :amd64],
+		]
+		re.each { |r|
+			if r[0] =~ RUBY_PLATFORM
+				break r[1]
+			end
+		}
+	}).call(),
+).freeze
 
 class Hash
 	def to_ostruct
